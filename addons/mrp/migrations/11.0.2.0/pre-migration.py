@@ -12,6 +12,13 @@ _column_renames = {
 }
 
 
-@openupgrade.migrate(use_env=False)
-def migrate(cr, version):
-    openupgrade.rename_columns(cr, _column_renames)
+@openupgrade.migrate(use_env=True)
+def migrate(env, version):
+    openupgrade.rename_columns(env.cr, _column_renames)
+    openupgrade.add_fields(
+        env, [
+            ('done_move', 'stock.move.line', 'stock_move_line', 'boolean',
+             False, 'mrp'),
+            ('is_done', 'stock.move', 'stock_move', 'boolean', False,
+             'mrp')
+        ])
