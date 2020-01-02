@@ -207,6 +207,24 @@ def fill_stock_move_line_consume_rel(cr):
     )
 
 
+@openupgrade.logging()
+def compute_is_done_stock_move(env):
+    openupgrade.logged_query(env.cr, """
+        UPDATE stock_move
+        SET is_done=true
+        WHERE state in ('done', 'cancel')
+    """)
+
+
+@openupgrade.logging()
+def compute_done_move_stock_move_line(env):
+    openupgrade.logged_query(env.cr, """
+        UPDATE stock_move_line
+        SET done_move=true
+        WHERE move_id in (select id from stock_move where is_done=true)
+    """)
+
+
 @openupgrade.migrate(use_env=True)
 def migrate(env, version):
     cr = env.cr
@@ -214,6 +232,8 @@ def migrate(env, version):
     create_stock_move_lines_from_stock_move_lots(env)
     update_stock_move_line_production_id(env)
     fill_stock_move_line_consume_rel(cr)
+    compute_is_done_stock_move(env)
+    compute_done_move_stock_move_line(env)
     openupgrade.load_data(
         cr, 'mrp', 'migrations/11.0.2.0/noupdate_changes.xml',
     )
