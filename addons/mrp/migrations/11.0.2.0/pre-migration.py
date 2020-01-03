@@ -18,7 +18,5 @@ def migrate(env, version):
     openupgrade.add_fields(
         env, [
             ('done_move', 'stock.move.line', 'stock_move_line', 'boolean',
-             False, 'mrp'),
-            ('is_done', 'stock.move', 'stock_move', 'boolean', False,
-             'mrp')
+             False, 'mrp')
         ])
