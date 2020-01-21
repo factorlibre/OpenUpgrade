@@ -22,6 +22,7 @@ renamed_modules = {
     'account_due_list_aging_comments': 'account_due_list_aging_comment',
     # OCA/partner-contact
     'partner_sector': 'partner_industry_secondary',
+    'partner_street_number': 'base_address_extended',
     # OCA/product-attribute
     'product_uom': 'product_uom_extra_data',  # -> OCA/community-data-files
     # OCA/purchase-workflow
@@ -84,6 +85,8 @@ merged_modules = {
     'hr_timesheet_sheet_week_start_day': 'hr_timesheet_sheet',
     # OCA/l10n-italy:
     'l10n_it_fiscalcode_invoice': 'l10n_it_fiscalcode',
+    # OCA/l10n-spain:
+    'l10n_es_account_group': 'l10n_es',
     # OCA/product-variant
     'product_variant_supplierinfo': 'product',
     'sale_stock_variant_configurator': 'sale_variant_configurator',
