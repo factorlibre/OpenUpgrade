@@ -131,7 +131,11 @@ def numerical_range_to_prefixes(min_, max_):
     for stop in split_to_ranges(min_, max_):
         pattern = ""
         any_digit_count = 0
-        for start_digit, stop_digit in zip(str(start), str(stop), strict=True):
+        # OOW-PY37-FIX (R28): zip(..., strict=...) requires Python 3.10+ but the
+        # OOW v16 container runs Python 3.7. split_to_ranges() guarantees equal
+        # digit-length pairs by construction (fill_by_nines/fill_by_zeros), so
+        # dropping strict= preserves correctness for valid inputs.
+        for start_digit, stop_digit in zip(str(start), str(stop)):
             if start_digit == stop_digit:
                 pattern += start_digit
             elif start_digit != "0" or stop_digit != "9":
