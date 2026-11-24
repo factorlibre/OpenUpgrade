@@ -414,73 +414,245 @@ def fill_company_account_journal_suspense_account_id(env):
 
 
 def fill_statement_lines_with_no_move(env):
-    stl_dates = {}
-    stl_dates_by_company = {}
+    # OOW-BATCHED-STL-V2 (BLY 2026-06-03, R24): version por LOTES.
+    # La original creaba el move de cada linea via ORM uno a uno (create +
+    # _synchronize_to_moves + write) a ~1/seg. Esta version produce el MISMO
+    # resultado (move 'entry' + 2 apuntes con los MISMOS
+    # _prepare_move_line_default_vals()) en 3 fases batcheadas:
+    #   A) crear los moves VACIOS en lotes,
+    #   B) enlazar move_id en las lineas (UPDATE masivo) -> los related
+    #      journal_id/date de la linea ya resuelven (dependen de move_id;
+    #      por eso NO se pueden calcular los vals antes de crear el move),
+    #   C) calcular vals con _prepare_move_line_default_vals() y crear los
+    #      apuntes con account.move.line.create() en lotes.
+    # AUTOVALIDACION: las primeras VALIDATE_N lineas van por el camino
+    # original (ground truth) y se comparan campo a campo contra los vals
+    # del batch; cualquier discrepancia ABORTA (rollback limpio del modulo).
+    VALIDATE_N = 200
+    BATCH = 500
+
+    legacy_date = openupgrade.get_legacy_name("date")
+
+    def _fetch_pending():
+        env.cr.execute(
+            """
+            SELECT id, %s, company_id
+            FROM account_bank_statement_line
+            WHERE move_id IS NULL
+            ORDER BY id"""
+            % legacy_date
+        )
+        return env.cr.fetchall()
+
+    rows = _fetch_pending()
+    stl_dates = {r[0]: r[1] for r in rows}
+    companies = {r[2] for r in rows}
+    total = len(rows)
+    _logger.info("OOW-BATCHED-STL-V2: %s statement lines sin move", total)
+    if not total:
+        return
+
+    # fail-fast: diarios con lineas pendientes y SIN cuenta por defecto ->
+    # el apunte de liquidez saldria con account_id NULL (constraint
+    # account_move_line_check_accountable_required_fields). Mejor abortar ya
+    # con la lista clara que reventar en el lote N (vease FIX3 del
+    # pre-migration.sql del step 04 para el data-fix de BLY).
     env.cr.execute(
         """
-        SELECT id, %s, company_id
-        FROM account_bank_statement_line
-        WHERE move_id IS NULL"""
-        % (openupgrade.get_legacy_name("date"),)
+        SELECT DISTINCT aj.id, aj.name
+        FROM account_bank_statement_line absl
+        JOIN account_bank_statement abs ON abs.id = absl.statement_id
+        JOIN account_journal aj ON aj.id = abs.journal_id
+        WHERE absl.move_id IS NULL AND aj.default_account_id IS NULL"""
     )
-    for stl_id, stl_date, stl_company in env.cr.fetchall():
-        stl_dates[stl_id] = stl_date
-        if stl_company in stl_dates_by_company:
-            stl_dates_by_company[stl_company] = min(
-                stl_date, stl_dates_by_company[stl_company]
-            )
-        else:
-            stl_dates_by_company[stl_company] = stl_date
-    st_lines = env["account.bank.statement.line"].browse(list(stl_dates.keys()))
-    for st_line in st_lines.with_context(
-        check_move_validity=False, tracking_disable=True
-    ):
-        move = env["account.move"].create(
-            {
-                "name": "/",
-                "date": stl_dates[st_line.id],
-                "statement_line_id": st_line.id,
-                "move_type": "entry",
-                "journal_id": st_line.statement_id.journal_id.id,
-                "company_id": st_line.statement_id.company_id.id,
-                "currency_id": st_line.statement_id.journal_id.currency_id.id
-                or st_line.statement_id.company_id.currency_id.id,
-            }
+    bad_journals = env.cr.fetchall()
+    if bad_journals:
+        raise Exception(
+            "OOW-BATCHED-STL-V2: diarios sin default_account_id con lineas"
+            " pendientes (configurar antes de migrar): %s" % bad_journals
         )
-        st_line.move_id = move
-        deprecated_accounts = env["account.account"].search(
-            [("deprecated", "=", True), ("company_id", "=", st_line.company_id.id)]
+
+    deprecated = env["account.account"].search(
+        [("deprecated", "=", True), ("company_id", "in", list(companies))]
+    )
+    deprecated.deprecated = False
+
+    def _move_header_vals(st_line):
+        journal = st_line.statement_id.journal_id
+        company_currency = journal.company_id.currency_id
+        journal_currency = (
+            journal.currency_id
+            if journal.currency_id and journal.currency_id != company_currency
+            else False
         )
-        deprecated_accounts.deprecated = False
-        try:
-            st_line._synchronize_to_moves(
-                [
-                    "payment_ref",
-                    "amount",
-                    "amount_currency",
-                    "foreign_currency_id",
-                    "currency_id",
-                    "partner_id",
-                ]
-            )
-        except Exception as e:
-            _logger.error("Failed for statement line with id %s: %s", st_line.id, e)
-            raise
-        deprecated_accounts.deprecated = True
-        to_write = {
-            "line_ids": [
-                (
-                    0,
-                    0,
-                    st_line._prepare_move_line_default_vals(
-                        counterpart_account_id=False
-                    )[0],
-                )
-            ]
+        return {
+            "name": "/",
+            "date": stl_dates[st_line.id],
+            "statement_line_id": st_line.id,
+            "move_type": "entry",
+            "journal_id": journal.id,
+            "company_id": journal.company_id.id,
+            "currency_id": (
+                st_line.foreign_currency_id or journal_currency or company_currency
+            ).id,
+            "partner_id": st_line.partner_id.id,
         }
-        st_line.move_id.with_context(skip_account_move_synchronization=True).write(
-            to_write
+
+    def _normalize_vals(vals_list):
+        res = []
+        for lv in vals_list:
+            res.append((
+                lv.get("account_id"),
+                round(lv.get("debit") or 0.0, 6),
+                round(lv.get("credit") or 0.0, 6),
+                round(lv.get("amount_currency") or 0.0, 6),
+                lv.get("currency_id") or False,
+                lv.get("partner_id") or False,
+            ))
+        return sorted(res)
+
+    def _normalize_move(move):
+        res = []
+        for line in move.line_ids:
+            res.append((
+                line.account_id.id,
+                round(line.debit or 0.0, 6),
+                round(line.credit or 0.0, 6),
+                round(line.amount_currency or 0.0, 6),
+                line.currency_id.id or False,
+                line.partner_id.id or False,
+            ))
+        return sorted(res)
+
+    try:
+        # ---- fase 1: camino ORIGINAL en las primeras VALIDATE_N (ground truth)
+        validate_ids = [r[0] for r in rows[:VALIDATE_N]]
+        st_lines = env["account.bank.statement.line"].browse(validate_ids)
+        for st_line in st_lines.with_context(
+            check_move_validity=False, tracking_disable=True
+        ):
+            move = env["account.move"].create(
+                {
+                    "name": "/",
+                    "date": stl_dates[st_line.id],
+                    "statement_line_id": st_line.id,
+                    "move_type": "entry",
+                    "journal_id": st_line.statement_id.journal_id.id,
+                    "company_id": st_line.statement_id.company_id.id,
+                    "currency_id": st_line.statement_id.journal_id.currency_id.id
+                    or st_line.statement_id.company_id.currency_id.id,
+                }
+            )
+            st_line.move_id = move
+            try:
+                st_line._synchronize_to_moves(
+                    [
+                        "payment_ref",
+                        "amount",
+                        "amount_currency",
+                        "foreign_currency_id",
+                        "currency_id",
+                        "partner_id",
+                    ]
+                )
+            except Exception as e:
+                _logger.error("Failed for statement line with id %s: %s", st_line.id, e)
+                raise
+            to_write = {
+                "line_ids": [
+                    (
+                        0,
+                        0,
+                        st_line._prepare_move_line_default_vals(
+                            counterpart_account_id=False
+                        )[0],
+                    )
+                ]
+            }
+            st_line.move_id.with_context(
+                skip_account_move_synchronization=True
+            ).write(to_write)
+
+        # ---- comparar: lo que produjo el original vs lo que produciria el
+        # batch (los mismos _prepare_* sobre lineas que YA tienen move).
+        mismatches = 0
+        for st_line in env["account.bank.statement.line"].browse(validate_ids):
+            move = st_line.move_id
+            header = _move_header_vals(st_line)
+            batch_vals = st_line._prepare_move_line_default_vals()
+            header_ok = (
+                move.journal_id.id == header["journal_id"]
+                and (move.partner_id.id or False) == (header["partner_id"] or False)
+                and move.currency_id.id == header["currency_id"]
+                and str(move.date) == str(header["date"])
+            )
+            exp_lines = _normalize_vals(batch_vals)
+            got_lines = _normalize_move(move)
+            if not header_ok or exp_lines != got_lines:
+                mismatches += 1
+                _logger.error(
+                    "OOW-BATCHED-STL-V2 MISMATCH stl=%s header_ok=%s exp=%s got=%s",
+                    st_line.id, header_ok, exp_lines, got_lines,
+                )
+        if mismatches:
+            raise Exception(
+                "OOW-BATCHED-STL-V2: validacion fallida (%s/%s) -> abort"
+                % (mismatches, len(validate_ids))
+            )
+        _logger.info(
+            "OOW-BATCHED-STL-V2: validacion OK en %s lineas", len(validate_ids)
         )
+        env["base"].flush()
+
+        # ---- fase 2A: crear moves VACIOS en lotes para el resto
+        pending = [r[0] for r in _fetch_pending()]
+        _logger.info("OOW-BATCHED-STL-V2: creando %s moves vacios", len(pending))
+        Move = env["account.move"].with_context(
+            check_move_validity=False,
+            tracking_disable=True,
+            skip_account_move_synchronization=True,
+        )
+        for start in range(0, len(pending), BATCH):
+            chunk_ids = pending[start:start + BATCH]
+            chunk = env["account.bank.statement.line"].browse(chunk_ids)
+            Move.create([_move_header_vals(sl) for sl in chunk])
+            env["base"].flush()
+            env.cache.invalidate()
+
+        # ---- fase 2B: enlazar move_id en bloque
+        env.cr.execute(
+            """
+            UPDATE account_bank_statement_line absl
+            SET move_id = am.id
+            FROM account_move am
+            WHERE am.statement_line_id = absl.id AND absl.move_id IS NULL"""
+        )
+        _logger.info("OOW-BATCHED-STL-V2: move_id enlazado en %s lineas", env.cr.rowcount)
+        env.cache.invalidate()
+
+        # ---- fase 2C: crear los apuntes en lotes con los vals canonicos
+        AML = env["account.move.line"].with_context(
+            check_move_validity=False,
+            tracking_disable=True,
+            skip_account_move_synchronization=True,
+        )
+        done = 0
+        for start in range(0, len(pending), BATCH):
+            chunk_ids = pending[start:start + BATCH]
+            chunk = env["account.bank.statement.line"].browse(chunk_ids).with_context(
+                check_move_validity=False, tracking_disable=True
+            )
+            vals_list = []
+            for sl in chunk:
+                vals_list.extend(sl._prepare_move_line_default_vals())
+            AML.create(vals_list)
+            done += len(chunk_ids)
+            if done % 5000 < BATCH or done == len(pending):
+                _logger.info("OOW-BATCHED-STL-V2: apuntes %s/%s lineas", done, len(pending))
+            env["base"].flush()
+            env.cache.invalidate()
+    finally:
+        deprecated.deprecated = True
 
     openupgrade.logged_query(
         env.cr,
@@ -912,6 +1084,43 @@ def cash_rounding_fields_to_company_dependent(env):
 
 @openupgrade.migrate()
 def migrate(env, version):
+    # OOW-PREMIG-SAFETY (BLY 2026-06-03): red de seguridad de R21/R22. En un run
+    # el pre-migration.sql de oow se aplico de forma incompleta (psql sin
+    # ON_ERROR_STOP y salida swallowed por exec_run -> un fallo en una sentencia
+    # es invisible). Re-aplicamos aqui las correcciones criticas de forma
+    # idempotente justo antes de que account las necesite. logged_query deja
+    # los conteos visibles en el log.
+    openupgrade.logged_query(env.cr, """
+        UPDATE ir_model_data d SET res_id = sub.pid FROM (
+            SELECT p.id AS pid FROM ir_property p
+            JOIN ir_model_fields f ON f.id = p.fields_id
+            WHERE f.model='res.partner' AND f.name='trust'
+              AND p.company_id IS NULL AND p.res_id IS NULL
+            ORDER BY p.id LIMIT 1) sub
+        WHERE d.module='account' AND d.name='default_followup_trust'
+          AND d.res_id IS DISTINCT FROM sub.pid""")
+    openupgrade.logged_query(env.cr, """
+        UPDATE ir_model_data d SET res_id = sub.pid FROM (
+            SELECT p.id AS pid FROM ir_property p
+            JOIN ir_model_fields f ON f.id = p.fields_id
+            WHERE f.model='res.partner' AND f.name='property_stock_customer'
+              AND p.company_id IS NULL AND p.res_id IS NULL
+            ORDER BY p.id LIMIT 1) sub
+        WHERE d.module='stock' AND d.name='property_stock_customer'
+          AND d.res_id IS DISTINCT FROM sub.pid""")
+    openupgrade.logged_query(env.cr, """
+        UPDATE account_reconcile_model
+        SET rule_type = 'invoice_matching'
+        WHERE rule_type IN ('writeoff_button', 'writeoff_suggestion')
+          AND account_id IS NULL""")
+    # OOW perf-fix (BLY 2026-06-02): indexar los FK usados como reverse-o2m
+    # (move.payment_ids / move.statement_line_ids) en los bucles/recompute por-move.
+    # Sin estos indices cada acceso es un seq-scan de account_payment / 
+    # account_bank_statement_line -> el post-migration tardaba dias. Idempotente.
+    if openupgrade.column_exists(env.cr, "account_payment", "move_id"):
+        env.cr.execute("CREATE INDEX IF NOT EXISTS account_payment_move_id_idx ON account_payment (move_id)")
+    if openupgrade.column_exists(env.cr, "account_bank_statement_line", "move_id"):
+        env.cr.execute("CREATE INDEX IF NOT EXISTS account_bank_statement_line_move_id_idx ON account_bank_statement_line (move_id)")
     cash_rounding_fields_to_company_dependent(env)
     fill_account_journal_posted_before(env)
     fill_code_prefix_end_field(env)
