@@ -5,6 +5,35 @@
 from openupgradelib import openupgrade
 
 
+def _oow_safe_rename_xmlid(cr, old_xmlid, new_xmlid):
+    """OOW-FL R106: rename de xmlid a prueba de colisión de clave única.
+
+    `openupgrade.rename_xmlids` hace `UPDATE ir_model_data SET name=new` que
+    revienta con duplicate key (module,name) cuando el xmlid NEW ya existe. En
+    BLY coexisten el food viejo (_a, p.ej. account_tax_template_p_iva0_ic_a →
+    plantilla "Alimentos") y el canónico v13 (_bc → "Bienes corrientes"),
+    enlazado a su plantilla por el bloque R60 del pre-migration.sql del step03.
+    El fix por SQL (FIX 3 / R106-SQL) no se disparaba de forma fiable dentro del
+    `psql --file` de OOW (DELETE 0 pese a condiciones satisfechas); AQUÍ, en el
+    cursor de Odoo durante la propia migración, la visibilidad del estado es
+    correcta. Si NEW ya existe se borra el xmlid VIEJO (se conserva el canónico,
+    que es el que espera account_tax_data.xml de v13); si no, rename normal.
+    """
+    module_old, name_old = old_xmlid.split(".", 1)
+    module_new, name_new = new_xmlid.split(".", 1)
+    cr.execute(
+        "SELECT 1 FROM ir_model_data WHERE module=%s AND name=%s",
+        (module_new, name_new),
+    )
+    if cr.fetchone():
+        cr.execute(
+            "DELETE FROM ir_model_data WHERE module=%s AND name=%s",
+            (module_old, name_old),
+        )
+    else:
+        openupgrade.rename_xmlids(cr, [(old_xmlid, new_xmlid)])
+
+
 def set_account_move_number_to_invoice_number(env):
     """l10n_es_account_invoice_sequence introduced different numbering between
     invoices and account moves.
@@ -75,16 +104,13 @@ def rename_food_taxes_and_fiscal_positions_xmlids(env):
     ]
     companies = env["res.company"].with_context(active_test=False).search([])
     for old, new in renames:
-        openupgrade.rename_xmlids(env.cr, [("l10n_es." + old, "l10n_es." + new)])
+        # OOW-FL R106: rename a prueba de colisión (ver _oow_safe_rename_xmlid)
+        _oow_safe_rename_xmlid(env.cr, "l10n_es." + old, "l10n_es." + new)
         for company in companies:
-            openupgrade.rename_xmlids(
+            _oow_safe_rename_xmlid(
                 env.cr,
-                [
-                    (
-                        "l10n_es.%s_" % company.id + old,
-                        "l10n_es.%s_" % company.id + new,
-                    ),
-                ],
+                "l10n_es.%s_" % company.id + old,
+                "l10n_es.%s_" % company.id + new,
             )
 
 
