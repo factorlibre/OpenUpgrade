@@ -272,11 +272,14 @@ def migration_invoice_moves(env):
             AND aml.old_invoice_line_id IS NULL"""))
     )
     # 2st: exclude from invoice_tab the grouped ones
+    # Their invoice lines are inserted again in the 4th step, with their own
+    # quantity, so the grouped item keeps the amount but not the quantity:
+    # otherwise reports by quantity count the units twice.
     openupgrade.logged_query(
         env.cr, """
         UPDATE account_move_line aml
         SET exclude_from_invoice_tab = TRUE, sequence = ail.sequence,
-        name = '(OLD GROUPED ITEM)' || aml.name,
+        name = '(OLD GROUPED ITEM)' || aml.name, quantity = 0.0,
         create_uid = ail.create_uid, create_date = ail.create_date
         FROM account_invoice_line ail
             JOIN account_invoice ai ON ail.invoice_id = ai.id AND ai.state NOT IN ('draft', 'cancel')
